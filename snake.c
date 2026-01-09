@@ -168,6 +168,10 @@ static void fb_flush(void) {
 /* Heartbeat timeout in milliseconds */
 #define HEARTBEAT_TIMEOUT_MS 500
 
+/* Snake speed settings (lower = faster) */
+#define MOVE_DELAY_INITIAL_MS 80
+#define MOVE_DELAY_MIN_MS 30
+
 /* Get current time in milliseconds */
 uint64_t get_time_ms(void) {
     struct timespec ts;
@@ -854,7 +858,7 @@ int main(void) {
     struct timespec last_move;
     clock_gettime(CLOCK_MONOTONIC, &last_move);
 
-    int move_delay_ms = 120;
+    int move_delay_ms = MOVE_DELAY_INITIAL_MS;
 
     while (1) {
         if (game->mode == MODE_PLAYER) {
@@ -872,8 +876,8 @@ int main(void) {
                 move_snake(game);
                 last_move = now;
 
-                move_delay_ms = 120 - (game->score / 20);
-                if (move_delay_ms < 50) move_delay_ms = 50;
+                move_delay_ms = MOVE_DELAY_INITIAL_MS - (game->score / 30);
+                if (move_delay_ms < MOVE_DELAY_MIN_MS) move_delay_ms = MOVE_DELAY_MIN_MS;
             }
         } else {
             /* Watcher mode - just wait for takeover */
