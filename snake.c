@@ -18,6 +18,7 @@
 #include <time.h>
 #include <termios.h>
 #include <signal.h>
+#include <stdarg.h>
 
 /* Maximum snake length */
 #define MAX_SNAKE_LEN 500
@@ -118,6 +119,51 @@ typedef struct {
 /* Terminal state for restoration */
 static struct termios orig_termios;
 static int terminal_configured = 0;
+
+/* Frame buffer for flicker-free rendering */
+#define FRAME_BUF_SIZE 16384
+static char frame_buf[FRAME_BUF_SIZE];
+static int frame_pos = 0;
+
+/* Frame buffer functions */
+static void fb_clear(void) {
+    frame_pos = 0;
+}
+
+static void fb_putchar(char c) {
+    if (frame_pos < FRAME_BUF_SIZE - 1) {
+        frame_buf[frame_pos++] = c;
+    }
+}
+
+static void fb_puts(const char *s) {
+    while (*s && frame_pos < FRAME_BUF_SIZE - 1) {
+        frame_buf[frame_pos++] = *s++;
+    }
+}
+
+static void fb_printf(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    int remaining = FRAME_BUF_SIZE - frame_pos - 1;
+    if (remaining > 0) {
+        int written = vsnprintf(frame_buf + frame_pos, remaining, fmt, args);
+        if (written > 0 && written < remaining) {
+            frame_pos += written;
+        }
+    }
+    va_end(args);
+}
+
+static void fb_move(int row, int col) {
+    fb_printf("\033[%d;%dH", row + 1, col + 1);
+}
+
+static void fb_flush(void) {
+    if (frame_pos > 0) {
+        write(STDOUT_FILENO, frame_buf, frame_pos);
+    }
+}
 
 /* Heartbeat timeout in milliseconds */
 #define HEARTBEAT_TIMEOUT_MS 500
@@ -420,83 +466,83 @@ Game* init_game(void) {
 
 /* Draw walls */
 void draw_walls(Game *g) {
-    printf(ANSI_CYAN);
+    fb_puts(ANSI_CYAN);
 
     /* Top wall */
-    term_move(g->game_top - 1, g->game_left);
-    putchar(CHAR_CORNER);
+    fb_move(g->game_top - 1, g->game_left);
+    fb_putchar(CHAR_CORNER);
     for (int x = 0; x < g->game_width; x++) {
-        putchar(CHAR_WALL_H);
+        fb_putchar(CHAR_WALL_H);
     }
-    putchar(CHAR_CORNER);
+    fb_putchar(CHAR_CORNER);
 
     /* Bottom wall */
-    term_move(g->game_top + g->game_height, g->game_left);
-    putchar(CHAR_CORNER);
+    fb_move(g->game_top + g->game_height, g->game_left);
+    fb_putchar(CHAR_CORNER);
     for (int x = 0; x < g->game_width; x++) {
-        putchar(CHAR_WALL_H);
+        fb_putchar(CHAR_WALL_H);
     }
-    putchar(CHAR_CORNER);
+    fb_putchar(CHAR_CORNER);
 
     /* Side walls */
     for (int y = 0; y < g->game_height; y++) {
-        term_move(g->game_top + y, g->game_left);
-        putchar(CHAR_WALL_V);
-        term_move(g->game_top + y, g->game_left + g->game_width + 1);
-        putchar(CHAR_WALL_V);
+        fb_move(g->game_top + y, g->game_left);
+        fb_putchar(CHAR_WALL_V);
+        fb_move(g->game_top + y, g->game_left + g->game_width + 1);
+        fb_putchar(CHAR_WALL_V);
     }
 
-    printf(ANSI_RESET);
+    fb_puts(ANSI_RESET);
 }
 
 /* Draw score bar */
 void draw_score(Game *g) {
     /* Title */
-    printf(ANSI_BOLD ANSI_CYAN);
+    fb_puts(ANSI_BOLD ANSI_CYAN);
     const char *title = "=== SNAKE GAME ===";
-    term_move(0, (g->screen_width - strlen(title)) / 2);
-    printf("%s", title);
-    printf(ANSI_RESET);
+    fb_move(0, (g->screen_width - strlen(title)) / 2);
+    fb_puts(title);
+    fb_puts(ANSI_RESET);
 
     /* Mode indicator */
-    term_move(0, 2);
+    fb_move(0, 2);
     if (g->mode == MODE_PLAYER) {
-        printf(ANSI_BOLD ANSI_YELLOW "[P%d:PLAYING]" ANSI_RESET, g->instance_id);
+        fb_printf(ANSI_BOLD ANSI_YELLOW "[P%d:PLAYING]" ANSI_RESET, g->instance_id);
     } else {
-        printf(ANSI_BOLD ANSI_YELLOW "[P%d:WATCHING]" ANSI_RESET, g->instance_id);
+        fb_printf(ANSI_BOLD ANSI_YELLOW "[P%d:WATCHING]" ANSI_RESET, g->instance_id);
     }
 
     /* Score */
-    printf(ANSI_BOLD ANSI_WHITE);
-    term_move(1, 2);
-    printf("Score: %d", g->score);
-    printf(ANSI_RESET);
+    fb_puts(ANSI_BOLD ANSI_WHITE);
+    fb_move(1, 2);
+    fb_printf("Score: %-6d", g->score);
+    fb_puts(ANSI_RESET);
 
     /* High score */
-    printf(ANSI_BOLD ANSI_RED);
-    term_move(1, g->screen_width / 2 - 10);
-    printf("High Score: %d", g->mmap_state->high_score);
-    printf(ANSI_RESET);
+    fb_puts(ANSI_BOLD ANSI_RED);
+    fb_move(1, g->screen_width / 2 - 10);
+    fb_printf("High Score: %-6d", g->mmap_state->high_score);
+    fb_puts(ANSI_RESET);
 
     /* Games played */
-    printf(ANSI_BLUE);
-    term_move(1, g->screen_width - 20);
-    printf("Games: %d", g->mmap_state->games_played);
-    printf(ANSI_RESET);
+    fb_puts(ANSI_BLUE);
+    fb_move(1, g->screen_width - 20);
+    fb_printf("Games: %-6d", g->mmap_state->games_played);
+    fb_puts(ANSI_RESET);
 
     /* Controls */
-    printf(ANSI_WHITE);
-    term_move(g->screen_height - 1, 0);
+    fb_puts(ANSI_WHITE);
+    fb_move(g->screen_height - 1, 0);
     if (g->mode == MODE_PLAYER) {
         const char *controls = "[Arrows] Move  [P] Pause  [R] Restart  [Q] Quit";
-        term_move(g->screen_height - 1, (g->screen_width - strlen(controls)) / 2);
-        printf("%s", controls);
+        fb_move(g->screen_height - 1, (g->screen_width - strlen(controls)) / 2);
+        fb_puts(controls);
     } else {
         const char *controls = "[Q] Quit  --  Waiting for other player to stop...";
-        term_move(g->screen_height - 1, (g->screen_width - strlen(controls)) / 2);
-        printf("%s", controls);
+        fb_move(g->screen_height - 1, (g->screen_width - strlen(controls)) / 2);
+        fb_puts(controls);
     }
-    printf(ANSI_RESET);
+    fb_puts(ANSI_RESET);
 }
 
 /* Draw snake */
@@ -508,10 +554,10 @@ void draw_snake(Game *g) {
         if (screen_x >= 0 && screen_x < g->screen_width - 1 &&
             screen_y >= 0 && screen_y < g->screen_height - 1) {
 
-            term_move(screen_y, screen_x);
+            fb_move(screen_y, screen_x);
 
             if (i == 0) {
-                printf(ANSI_BOLD ANSI_YELLOW);
+                fb_puts(ANSI_BOLD ANSI_YELLOW);
                 char head_char;
                 switch (g->direction) {
                     case DIR_UP:    head_char = CHAR_HEAD_UP; break;
@@ -519,16 +565,16 @@ void draw_snake(Game *g) {
                     case DIR_LEFT:  head_char = CHAR_HEAD_LEFT; break;
                     default:        head_char = CHAR_HEAD_RIGHT; break;
                 }
-                putchar(head_char);
-                printf(ANSI_RESET);
+                fb_putchar(head_char);
+                fb_puts(ANSI_RESET);
             } else if (i == g->snake_len - 1) {
-                printf(ANSI_BLUE);
-                putchar(CHAR_TAIL);
-                printf(ANSI_RESET);
+                fb_puts(ANSI_BLUE);
+                fb_putchar(CHAR_TAIL);
+                fb_puts(ANSI_RESET);
             } else {
-                printf(ANSI_GREEN);
-                putchar(CHAR_BODY);
-                printf(ANSI_RESET);
+                fb_puts(ANSI_GREEN);
+                fb_putchar(CHAR_BODY);
+                fb_puts(ANSI_RESET);
             }
         }
     }
@@ -541,8 +587,10 @@ void draw_food(Game *g) {
 
     if (screen_x >= 0 && screen_x < g->screen_width - 1 &&
         screen_y >= 0 && screen_y < g->screen_height - 1) {
-        term_move(screen_y, screen_x);
-        printf(ANSI_BOLD ANSI_RED "%c" ANSI_RESET, CHAR_FOOD);
+        fb_move(screen_y, screen_x);
+        fb_puts(ANSI_BOLD ANSI_RED);
+        fb_putchar(CHAR_FOOD);
+        fb_puts(ANSI_RESET);
     }
 }
 
@@ -558,18 +606,18 @@ void draw_game_over(Game *g) {
     int num_lines = 5;
     int start_y = g->screen_height / 2 - num_lines / 2;
 
-    printf(ANSI_BOLD ANSI_MAGENTA);
+    fb_puts(ANSI_BOLD ANSI_MAGENTA);
     for (int i = 0; i < num_lines; i++) {
         int x = (g->screen_width - strlen(lines[i])) / 2;
-        term_move(start_y + i, x);
-        printf("%s", lines[i]);
+        fb_move(start_y + i, x);
+        fb_puts(lines[i]);
     }
 
     char score_line[30];
     snprintf(score_line, sizeof(score_line), "|   Final Score: %-5d   |", g->score);
-    term_move(start_y + 2, (g->screen_width - strlen(score_line)) / 2);
-    printf("%s", score_line);
-    printf(ANSI_RESET);
+    fb_move(start_y + 2, (g->screen_width - strlen(score_line)) / 2);
+    fb_puts(score_line);
+    fb_puts(ANSI_RESET);
 }
 
 /* Draw pause screen */
@@ -583,13 +631,13 @@ void draw_paused(Game *g) {
     int num_lines = 4;
     int start_y = g->screen_height / 2 - num_lines / 2;
 
-    printf(ANSI_BOLD ANSI_WHITE);
+    fb_puts(ANSI_BOLD ANSI_WHITE);
     for (int i = 0; i < num_lines; i++) {
         int x = (g->screen_width - strlen(lines[i])) / 2;
-        term_move(start_y + i, x);
-        printf("%s", lines[i]);
+        fb_move(start_y + i, x);
+        fb_puts(lines[i]);
     }
-    printf(ANSI_RESET);
+    fb_puts(ANSI_RESET);
 }
 
 /* Draw watcher waiting message */
@@ -605,13 +653,13 @@ void draw_watcher_status(Game *g) {
     int num_lines = 6;
     int start_y = g->screen_height / 2 - num_lines / 2;
 
-    printf(ANSI_BOLD ANSI_YELLOW);
+    fb_puts(ANSI_BOLD ANSI_YELLOW);
     for (int i = 0; i < num_lines; i++) {
         int x = (g->screen_width - strlen(lines[i])) / 2;
-        term_move(start_y + i, x);
-        printf("%s", lines[i]);
+        fb_move(start_y + i, x);
+        fb_puts(lines[i]);
     }
-    printf(ANSI_RESET);
+    fb_puts(ANSI_RESET);
 }
 
 /* Move snake */
@@ -723,7 +771,17 @@ int handle_watcher_input(Game *g) {
 
 /* Draw everything */
 void draw(Game *g) {
-    term_clear();
+    fb_clear();
+    fb_puts("\033[H");  /* Cursor home instead of clear */
+
+    /* Clear the game area by drawing spaces */
+    for (int y = g->game_top; y < g->game_top + g->game_height; y++) {
+        fb_move(y, g->game_left + 1);
+        for (int x = 0; x < g->game_width; x++) {
+            fb_putchar(' ');
+        }
+    }
+
     draw_walls(g);
     draw_score(g);
 
@@ -742,7 +800,10 @@ void draw(Game *g) {
         }
     }
 
-    term_flush();
+    /* Move cursor to corner so it doesn't follow the snake */
+    fb_puts("\033[1;1H");
+
+    fb_flush();
 }
 
 /* Cleanup */
