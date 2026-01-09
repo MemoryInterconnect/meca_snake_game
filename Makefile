@@ -1,10 +1,9 @@
-CC = riscv64-linux-gnu-gcc
-CFLAGS = -Wall -Wextra -O2 -static
-LDFLAGS = -static
-
-# Path to RISC-V static libraries (set this to your ncurses install path)
-LIBDIR ?= /usr/riscv64-linux-gnu/lib
-INCDIR ?= /usr/riscv64-linux-gnu/include
+#CC = riscv64-linux-gnu-gcc
+CC = gcc
+#CFLAGS = -Wall -Wextra -O2 -static
+CFLAGS = -Wall -Wextra -O2
+#LDFLAGS = -static
+LDFLAGS =
 
 LIBS = -lncursesw -ltinfo
 
