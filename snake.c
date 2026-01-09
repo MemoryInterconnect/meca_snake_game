@@ -1,8 +1,8 @@
 /*
  * Terminal Snake Game - 2 Instance Version
- * Features: Colors, Unicode characters, mmap-based shared state
+ * Features: ANSI colors, ASCII characters, mmap-based shared state
  * Two instances share game state - one plays, one watches
- * Compile: gcc -o snake snake.c -lncursesw
+ * Compile: gcc -o snake snake.c
  */
 
 #define _GNU_SOURCE
@@ -14,10 +14,10 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/select.h>
 #include <time.h>
-#include <locale.h>
-#include <ncurses.h>
-#include <wchar.h>
+#include <termios.h>
+#include <signal.h>
 
 /* Maximum snake length */
 #define MAX_SNAKE_LEN 500
@@ -61,33 +61,28 @@ enum GameState { STATE_RUNNING = 0, STATE_PAUSED = 1, STATE_GAME_OVER = 2 };
 /* Instance mode */
 enum InstanceMode { MODE_PLAYER = 0, MODE_WATCHER = 1 };
 
-/* Color pairs */
-enum Colors {
-    COLOR_SNAKE_BODY = 1,
-    COLOR_SNAKE_HEAD = 2,
-    COLOR_FOOD = 3,
-    COLOR_WALL = 4,
-    COLOR_SCORE = 5,
-    COLOR_GAMEOVER = 6,
-    COLOR_TAIL = 7,
-    COLOR_TITLE = 8,
-    COLOR_WATCHER = 9
-};
+/* ANSI color codes */
+#define ANSI_RESET      "\033[0m"
+#define ANSI_BOLD       "\033[1m"
+#define ANSI_GREEN      "\033[32m"
+#define ANSI_YELLOW     "\033[33m"
+#define ANSI_RED        "\033[31m"
+#define ANSI_CYAN       "\033[36m"
+#define ANSI_WHITE      "\033[37m"
+#define ANSI_MAGENTA    "\033[35m"
+#define ANSI_BLUE       "\033[34m"
 
-/* Unicode characters */
-#define CHAR_WALL_H    L"═"
-#define CHAR_WALL_V    L"║"
-#define CHAR_CORNER_TL L"╔"
-#define CHAR_CORNER_TR L"╗"
-#define CHAR_CORNER_BL L"╚"
-#define CHAR_CORNER_BR L"╝"
-#define CHAR_FOOD      L"★"
-#define CHAR_BODY      L"●"
-#define CHAR_TAIL      L"○"
-#define CHAR_HEAD_UP   L"▲"
-#define CHAR_HEAD_DOWN L"▼"
-#define CHAR_HEAD_LEFT L"◀"
-#define CHAR_HEAD_RIGHT L"▶"
+/* ASCII characters */
+#define CHAR_WALL_H    '-'
+#define CHAR_WALL_V    '|'
+#define CHAR_CORNER    '+'
+#define CHAR_FOOD      '*'
+#define CHAR_BODY      'o'
+#define CHAR_TAIL      '.'
+#define CHAR_HEAD_UP   '^'
+#define CHAR_HEAD_DOWN 'v'
+#define CHAR_HEAD_LEFT '<'
+#define CHAR_HEAD_RIGHT '>'
 
 /* Local point for game logic */
 typedef struct {
@@ -120,6 +115,10 @@ typedef struct {
     int mode;                     /* MODE_PLAYER or MODE_WATCHER */
 } Game;
 
+/* Terminal state for restoration */
+static struct termios orig_termios;
+static int terminal_configured = 0;
+
 /* Heartbeat timeout in milliseconds */
 #define HEARTBEAT_TIMEOUT_MS 500
 
@@ -131,11 +130,14 @@ uint64_t get_time_ms(void) {
 }
 
 /* Physical memory offset */
-#define MEM_OFFSET 0x200000000ULL
+//#define DEVMEM "/dev/mem"
+//#define MEM_OFFSET 0x200000000ULL
+#define DEVMEM "./mem"
+#define MEM_OFFSET 0x0ULL
 
 /* Initialize mmap to /dev/mem */
 GameMmap* init_mmap(int *fd) {
-    *fd = open("/dev/mem", O_RDWR | O_SYNC);
+    *fd = open(DEVMEM, O_RDWR | O_SYNC);
     if (*fd < 0) {
         perror("open /dev/mem");
         return NULL;
@@ -151,20 +153,84 @@ GameMmap* init_mmap(int *fd) {
     return mm;
 }
 
-/* Initialize colors */
-void init_colors(void) {
-    start_color();
-    use_default_colors();
+/* Terminal control functions using ANSI escape codes */
+void term_clear(void) {
+    printf("\033[2J");
+}
 
-    init_pair(COLOR_SNAKE_BODY, COLOR_GREEN, -1);
-    init_pair(COLOR_SNAKE_HEAD, COLOR_YELLOW, -1);
-    init_pair(COLOR_FOOD, COLOR_RED, -1);
-    init_pair(COLOR_WALL, COLOR_CYAN, -1);
-    init_pair(COLOR_SCORE, COLOR_WHITE, -1);
-    init_pair(COLOR_GAMEOVER, COLOR_MAGENTA, -1);
-    init_pair(COLOR_TAIL, COLOR_BLUE, -1);
-    init_pair(COLOR_TITLE, COLOR_CYAN, -1);
-    init_pair(COLOR_WATCHER, COLOR_YELLOW, -1);
+void term_move(int row, int col) {
+    printf("\033[%d;%dH", row + 1, col + 1);
+}
+
+void term_hide_cursor(void) {
+    printf("\033[?25l");
+}
+
+void term_show_cursor(void) {
+    printf("\033[?25h");
+}
+
+void term_flush(void) {
+    fflush(stdout);
+}
+
+/* Configure terminal for raw input */
+void term_raw_mode(void) {
+    if (terminal_configured) return;
+
+    tcgetattr(STDIN_FILENO, &orig_termios);
+    terminal_configured = 1;
+
+    struct termios raw = orig_termios;
+    raw.c_lflag &= ~(ECHO | ICANON);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+}
+
+/* Restore terminal settings */
+void term_restore(void) {
+    if (terminal_configured) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+        terminal_configured = 0;
+    }
+    term_show_cursor();
+    printf(ANSI_RESET);
+    term_flush();
+}
+
+/* Non-blocking character read */
+int term_getch(void) {
+    fd_set fds;
+    struct timeval tv;
+
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 50000;  /* 50ms timeout */
+
+    if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0) {
+        unsigned char c;
+        if (read(STDIN_FILENO, &c, 1) == 1) {
+            /* Handle escape sequences for arrow keys */
+            if (c == 27) {  /* ESC */
+                unsigned char seq[2];
+                if (read(STDIN_FILENO, &seq[0], 1) == 1 && seq[0] == '[') {
+                    if (read(STDIN_FILENO, &seq[1], 1) == 1) {
+                        switch (seq[1]) {
+                            case 'A': return 1001;  /* Up */
+                            case 'B': return 1002;  /* Down */
+                            case 'C': return 1003;  /* Right */
+                            case 'D': return 1004;  /* Left */
+                        }
+                    }
+                }
+                return 27;
+            }
+            return c;
+        }
+    }
+    return -1;  /* No input */
 }
 
 /* Spawn food at random location */
@@ -328,16 +394,10 @@ Game* init_game(void) {
         g->mode = MODE_WATCHER;
     }
 
-    /* Initialize ncurses */
-    initscr();
-    cbreak();
-    noecho();
-    keypad(stdscr, TRUE);
-    curs_set(0);
-    nodelay(stdscr, TRUE);
-    timeout(50);  /* 50ms refresh for responsive watching */
-
-    init_colors();
+    /* Initialize terminal */
+    term_raw_mode();
+    term_hide_cursor();
+    term_clear();
 
     /* Fixed 80x24 screen size */
     g->screen_width = 80;
@@ -360,67 +420,83 @@ Game* init_game(void) {
 
 /* Draw walls */
 void draw_walls(Game *g) {
-    attron(COLOR_PAIR(COLOR_WALL));
+    printf(ANSI_CYAN);
 
-    mvaddwstr(g->game_top - 1, g->game_left, CHAR_CORNER_TL);
+    /* Top wall */
+    term_move(g->game_top - 1, g->game_left);
+    putchar(CHAR_CORNER);
     for (int x = 0; x < g->game_width; x++) {
-        addwstr(CHAR_WALL_H);
+        putchar(CHAR_WALL_H);
     }
-    addwstr(CHAR_CORNER_TR);
+    putchar(CHAR_CORNER);
 
-    mvaddwstr(g->game_top + g->game_height, g->game_left, CHAR_CORNER_BL);
+    /* Bottom wall */
+    term_move(g->game_top + g->game_height, g->game_left);
+    putchar(CHAR_CORNER);
     for (int x = 0; x < g->game_width; x++) {
-        addwstr(CHAR_WALL_H);
+        putchar(CHAR_WALL_H);
     }
-    addwstr(CHAR_CORNER_BR);
+    putchar(CHAR_CORNER);
 
+    /* Side walls */
     for (int y = 0; y < g->game_height; y++) {
-        mvaddwstr(g->game_top + y, g->game_left, CHAR_WALL_V);
-        mvaddwstr(g->game_top + y, g->game_left + g->game_width + 1, CHAR_WALL_V);
+        term_move(g->game_top + y, g->game_left);
+        putchar(CHAR_WALL_V);
+        term_move(g->game_top + y, g->game_left + g->game_width + 1);
+        putchar(CHAR_WALL_V);
     }
 
-    attroff(COLOR_PAIR(COLOR_WALL));
+    printf(ANSI_RESET);
 }
 
 /* Draw score bar */
 void draw_score(Game *g) {
-    attron(COLOR_PAIR(COLOR_TITLE) | A_BOLD);
+    /* Title */
+    printf(ANSI_BOLD ANSI_CYAN);
     const char *title = "=== SNAKE GAME ===";
-    mvprintw(0, (g->screen_width - strlen(title)) / 2, "%s", title);
-    attroff(COLOR_PAIR(COLOR_TITLE) | A_BOLD);
+    term_move(0, (g->screen_width - strlen(title)) / 2);
+    printf("%s", title);
+    printf(ANSI_RESET);
 
-    /* Show mode indicator */
+    /* Mode indicator */
+    term_move(0, 2);
     if (g->mode == MODE_PLAYER) {
-        attron(COLOR_PAIR(COLOR_SNAKE_HEAD) | A_BOLD);
-        mvprintw(0, 2, "[P%d:PLAYING]", g->instance_id);
-        attroff(COLOR_PAIR(COLOR_SNAKE_HEAD) | A_BOLD);
+        printf(ANSI_BOLD ANSI_YELLOW "[P%d:PLAYING]" ANSI_RESET, g->instance_id);
     } else {
-        attron(COLOR_PAIR(COLOR_WATCHER) | A_BOLD);
-        mvprintw(0, 2, "[P%d:WATCHING]", g->instance_id);
-        attroff(COLOR_PAIR(COLOR_WATCHER) | A_BOLD);
+        printf(ANSI_BOLD ANSI_YELLOW "[P%d:WATCHING]" ANSI_RESET, g->instance_id);
     }
 
-    attron(COLOR_PAIR(COLOR_SCORE) | A_BOLD);
-    mvprintw(1, 2, "Score: %d", g->score);
-    attroff(COLOR_PAIR(COLOR_SCORE) | A_BOLD);
+    /* Score */
+    printf(ANSI_BOLD ANSI_WHITE);
+    term_move(1, 2);
+    printf("Score: %d", g->score);
+    printf(ANSI_RESET);
 
-    attron(COLOR_PAIR(COLOR_FOOD) | A_BOLD);
-    mvprintw(1, g->screen_width / 2 - 10, "High Score: %d", g->mmap_state->high_score);
-    attroff(COLOR_PAIR(COLOR_FOOD) | A_BOLD);
+    /* High score */
+    printf(ANSI_BOLD ANSI_RED);
+    term_move(1, g->screen_width / 2 - 10);
+    printf("High Score: %d", g->mmap_state->high_score);
+    printf(ANSI_RESET);
 
-    attron(COLOR_PAIR(COLOR_TAIL));
-    mvprintw(1, g->screen_width - 20, "Games: %d", g->mmap_state->games_played);
-    attroff(COLOR_PAIR(COLOR_TAIL));
+    /* Games played */
+    printf(ANSI_BLUE);
+    term_move(1, g->screen_width - 20);
+    printf("Games: %d", g->mmap_state->games_played);
+    printf(ANSI_RESET);
 
-    attron(COLOR_PAIR(COLOR_SCORE));
+    /* Controls */
+    printf(ANSI_WHITE);
+    term_move(g->screen_height - 1, 0);
     if (g->mode == MODE_PLAYER) {
         const char *controls = "[Arrows] Move  [P] Pause  [R] Restart  [Q] Quit";
-        mvprintw(g->screen_height - 1, (g->screen_width - strlen(controls)) / 2, "%s", controls);
+        term_move(g->screen_height - 1, (g->screen_width - strlen(controls)) / 2);
+        printf("%s", controls);
     } else {
         const char *controls = "[Q] Quit  --  Waiting for other player to stop...";
-        mvprintw(g->screen_height - 1, (g->screen_width - strlen(controls)) / 2, "%s", controls);
+        term_move(g->screen_height - 1, (g->screen_width - strlen(controls)) / 2);
+        printf("%s", controls);
     }
-    attroff(COLOR_PAIR(COLOR_SCORE));
+    printf(ANSI_RESET);
 }
 
 /* Draw snake */
@@ -432,25 +508,27 @@ void draw_snake(Game *g) {
         if (screen_x >= 0 && screen_x < g->screen_width - 1 &&
             screen_y >= 0 && screen_y < g->screen_height - 1) {
 
+            term_move(screen_y, screen_x);
+
             if (i == 0) {
-                attron(COLOR_PAIR(COLOR_SNAKE_HEAD) | A_BOLD);
-                const wchar_t *head_char;
+                printf(ANSI_BOLD ANSI_YELLOW);
+                char head_char;
                 switch (g->direction) {
                     case DIR_UP:    head_char = CHAR_HEAD_UP; break;
                     case DIR_DOWN:  head_char = CHAR_HEAD_DOWN; break;
                     case DIR_LEFT:  head_char = CHAR_HEAD_LEFT; break;
                     default:        head_char = CHAR_HEAD_RIGHT; break;
                 }
-                mvaddwstr(screen_y, screen_x, head_char);
-                attroff(COLOR_PAIR(COLOR_SNAKE_HEAD) | A_BOLD);
+                putchar(head_char);
+                printf(ANSI_RESET);
             } else if (i == g->snake_len - 1) {
-                attron(COLOR_PAIR(COLOR_TAIL));
-                mvaddwstr(screen_y, screen_x, CHAR_TAIL);
-                attroff(COLOR_PAIR(COLOR_TAIL));
+                printf(ANSI_BLUE);
+                putchar(CHAR_TAIL);
+                printf(ANSI_RESET);
             } else {
-                attron(COLOR_PAIR(COLOR_SNAKE_BODY));
-                mvaddwstr(screen_y, screen_x, CHAR_BODY);
-                attroff(COLOR_PAIR(COLOR_SNAKE_BODY));
+                printf(ANSI_GREEN);
+                putchar(CHAR_BODY);
+                printf(ANSI_RESET);
             }
         }
     }
@@ -463,9 +541,8 @@ void draw_food(Game *g) {
 
     if (screen_x >= 0 && screen_x < g->screen_width - 1 &&
         screen_y >= 0 && screen_y < g->screen_height - 1) {
-        attron(COLOR_PAIR(COLOR_FOOD) | A_BOLD);
-        mvaddwstr(screen_y, screen_x, CHAR_FOOD);
-        attroff(COLOR_PAIR(COLOR_FOOD) | A_BOLD);
+        term_move(screen_y, screen_x);
+        printf(ANSI_BOLD ANSI_RED "%c" ANSI_RESET, CHAR_FOOD);
     }
 }
 
@@ -481,16 +558,18 @@ void draw_game_over(Game *g) {
     int num_lines = 5;
     int start_y = g->screen_height / 2 - num_lines / 2;
 
-    attron(COLOR_PAIR(COLOR_GAMEOVER) | A_BOLD);
+    printf(ANSI_BOLD ANSI_MAGENTA);
     for (int i = 0; i < num_lines; i++) {
         int x = (g->screen_width - strlen(lines[i])) / 2;
-        mvprintw(start_y + i, x, "%s", lines[i]);
+        term_move(start_y + i, x);
+        printf("%s", lines[i]);
     }
 
     char score_line[30];
     snprintf(score_line, sizeof(score_line), "|   Final Score: %-5d   |", g->score);
-    mvprintw(start_y + 2, (g->screen_width - strlen(score_line)) / 2, "%s", score_line);
-    attroff(COLOR_PAIR(COLOR_GAMEOVER) | A_BOLD);
+    term_move(start_y + 2, (g->screen_width - strlen(score_line)) / 2);
+    printf("%s", score_line);
+    printf(ANSI_RESET);
 }
 
 /* Draw pause screen */
@@ -504,12 +583,13 @@ void draw_paused(Game *g) {
     int num_lines = 4;
     int start_y = g->screen_height / 2 - num_lines / 2;
 
-    attron(COLOR_PAIR(COLOR_SCORE) | A_BOLD);
+    printf(ANSI_BOLD ANSI_WHITE);
     for (int i = 0; i < num_lines; i++) {
         int x = (g->screen_width - strlen(lines[i])) / 2;
-        mvprintw(start_y + i, x, "%s", lines[i]);
+        term_move(start_y + i, x);
+        printf("%s", lines[i]);
     }
-    attroff(COLOR_PAIR(COLOR_SCORE) | A_BOLD);
+    printf(ANSI_RESET);
 }
 
 /* Draw watcher waiting message */
@@ -525,12 +605,13 @@ void draw_watcher_status(Game *g) {
     int num_lines = 6;
     int start_y = g->screen_height / 2 - num_lines / 2;
 
-    attron(COLOR_PAIR(COLOR_WATCHER) | A_BOLD);
+    printf(ANSI_BOLD ANSI_YELLOW);
     for (int i = 0; i < num_lines; i++) {
         int x = (g->screen_width - strlen(lines[i])) / 2;
-        mvprintw(start_y + i, x, "%s", lines[i]);
+        term_move(start_y + i, x);
+        printf("%s", lines[i]);
     }
-    attroff(COLOR_PAIR(COLOR_WATCHER) | A_BOLD);
+    printf(ANSI_RESET);
 }
 
 /* Move snake */
@@ -582,7 +663,8 @@ void move_snake(Game *g) {
 
 /* Handle input for player mode */
 int handle_player_input(Game *g) {
-    int ch = getch();
+    int ch = term_getch();
+    if (ch < 0) return 1;  /* No input */
 
     switch (ch) {
         case 'q':
@@ -603,22 +685,22 @@ int handle_player_input(Game *g) {
             update_mmap(g);
             break;
 
-        case KEY_UP:
+        case 1001:  /* Up arrow */
             if (!g->game_over && !g->paused && g->direction != DIR_DOWN)
                 g->next_direction = DIR_UP;
             break;
 
-        case KEY_DOWN:
+        case 1002:  /* Down arrow */
             if (!g->game_over && !g->paused && g->direction != DIR_UP)
                 g->next_direction = DIR_DOWN;
             break;
 
-        case KEY_LEFT:
+        case 1004:  /* Left arrow */
             if (!g->game_over && !g->paused && g->direction != DIR_RIGHT)
                 g->next_direction = DIR_LEFT;
             break;
 
-        case KEY_RIGHT:
+        case 1003:  /* Right arrow */
             if (!g->game_over && !g->paused && g->direction != DIR_LEFT)
                 g->next_direction = DIR_RIGHT;
             break;
@@ -630,7 +712,7 @@ int handle_player_input(Game *g) {
 /* Handle input for watcher mode */
 int handle_watcher_input(Game *g) {
     (void)g;  /* Unused in watcher mode */
-    int ch = getch();
+    int ch = term_getch();
 
     if (ch == 'q' || ch == 'Q') {
         return 0;
@@ -641,7 +723,7 @@ int handle_watcher_input(Game *g) {
 
 /* Draw everything */
 void draw(Game *g) {
-    clear();
+    term_clear();
     draw_walls(g);
     draw_score(g);
 
@@ -660,7 +742,7 @@ void draw(Game *g) {
         }
     }
 
-    refresh();
+    term_flush();
 }
 
 /* Cleanup */
@@ -679,18 +761,34 @@ void cleanup(Game *g) {
         }
         free(g);
     }
-    endwin();
+    term_restore();
+    term_clear();
+    term_move(0, 0);
+    term_flush();
+}
+
+/* Signal handler for clean exit */
+static Game *global_game = NULL;
+
+void signal_handler(int sig) {
+    (void)sig;
+    if (global_game) {
+        cleanup(global_game);
+    }
+    exit(0);
 }
 
 /* Main */
 int main(void) {
-    setlocale(LC_ALL, "");
-
     Game *game = init_game();
     if (!game) {
         fprintf(stderr, "Failed to initialize game\n");
         return 1;
     }
+
+    global_game = game;
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
 
     struct timespec last_move;
     clock_gettime(CLOCK_MONOTONIC, &last_move);
