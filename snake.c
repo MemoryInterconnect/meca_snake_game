@@ -1,912 +1,840 @@
-/*
- * Terminal Snake Game - 2 Instance Version
- * Features: ANSI colors, ASCII characters, mmap-based shared state
- * Two instances share game state - one plays, one watches
- * Compile: gcc -o snake snake.c
- */
-
 #define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/select.h>
-#include <time.h>
 #include <termios.h>
 #include <signal.h>
-#include <stdarg.h>
+#include <time.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
+#include <sys/time.h>
+#include <errno.h>
 
-/* Maximum snake length */
-#define MAX_SNAKE_LEN 500
+/* Game constants */
+#define MAX_SNAKE_LEN 1000
+#define BOARD_WIDTH 78
+#define BOARD_HEIGHT 18
+#define MEM_FILE "./mem"
+#define INITIAL_SNAKE_LEN 3
+#define BASE_MOVE_INTERVAL_MS 200
+#define MIN_MOVE_INTERVAL_MS 50
 
-/* Memory map layout (./mem file) */
-#define MMAP_SIZE 8192
+/* Direction constants */
+#define DIR_UP    0
+#define DIR_DOWN  1
+#define DIR_LEFT  2
+#define DIR_RIGHT 3
 
-/* Snake segment stored in mmap */
+/* Game state constants */
+#define STATE_RUNNING  0
+#define STATE_PAUSED   1
+#define STATE_GAMEOVER 2
+
+/* ANSI color codes */
+#define COLOR_RESET   "\033[0m"
+#define COLOR_GREEN   "\033[32m"
+#define COLOR_RED     "\033[31m"
+#define COLOR_YELLOW  "\033[33m"
+#define COLOR_BLUE    "\033[34m"
+#define COLOR_CYAN    "\033[36m"
+#define COLOR_WHITE   "\033[37m"
+#define COLOR_BRIGHT_GREEN "\033[92m"
+#define COLOR_BG_GREEN "\033[42m"
+#define COLOR_BG_RED   "\033[41m"
+
+#define MAGIC_NUMBER    0x12345678
+
+/* Point structure */
 typedef struct {
-    int16_t x, y;
-} MmapPoint;
+    int32_t x;
+    int32_t y;
+} Point;
 
-/* Shared game state in mmap */
+/* Shared game state structure */
 typedef struct {
-    /* Instance control */
-    uint32_t active_player;       /* 0=none, 1=instance1, 2=instance2 */
-    uint64_t heartbeat;           /* Timestamp of last update (ms) */
-
-    /* Game state */
+    uint64_t heartbeat;
+    uint32_t magic_number;
+    uint32_t game_state;
     uint32_t score;
     uint32_t high_score;
     uint32_t snake_length;
-    uint32_t game_state;          /* 0=running, 1=paused, 2=game_over */
-    uint32_t direction;           /* 0=UP, 1=DOWN, 2=LEFT, 3=RIGHT */
+    uint32_t direction;
     int32_t food_x;
     int32_t food_y;
-    uint32_t games_played;
-    uint32_t total_food;
-    uint32_t max_length;
-
-    /* Full snake body for watcher to display */
-    MmapPoint snake[MAX_SNAKE_LEN];
-} GameMmap;
-
-/* Direction enum */
-enum Direction { DIR_UP = 0, DIR_DOWN = 1, DIR_LEFT = 2, DIR_RIGHT = 3 };
-
-/* Game state enum */
-enum GameState { STATE_RUNNING = 0, STATE_PAUSED = 1, STATE_GAME_OVER = 2 };
-
-/* Instance mode */
-enum InstanceMode { MODE_PLAYER = 0, MODE_WATCHER = 1 };
-
-/* ANSI color codes */
-#define ANSI_RESET      "\033[0m"
-#define ANSI_BOLD       "\033[1m"
-#define ANSI_GREEN      "\033[32m"
-#define ANSI_YELLOW     "\033[33m"
-#define ANSI_RED        "\033[31m"
-#define ANSI_CYAN       "\033[36m"
-#define ANSI_WHITE      "\033[37m"
-#define ANSI_MAGENTA    "\033[35m"
-#define ANSI_BLUE       "\033[34m"
-
-/* ASCII characters */
-#define CHAR_WALL_H    '-'
-#define CHAR_WALL_V    '|'
-#define CHAR_CORNER    '+'
-#define CHAR_FOOD      '*'
-#define CHAR_BODY      'o'
-#define CHAR_TAIL      '.'
-#define CHAR_HEAD_UP   '^'
-#define CHAR_HEAD_DOWN 'v'
-#define CHAR_HEAD_LEFT '<'
-#define CHAR_HEAD_RIGHT '>'
-
-/* Local point for game logic */
-typedef struct {
-    int x, y;
-} Point;
-
-/* Game structure */
-typedef struct {
+    uint32_t takeover_request;    /* 1 = active wants to hand over control */
     Point snake[MAX_SNAKE_LEN];
-    int snake_len;
-    int direction;
-    int next_direction;
-    Point food;
-    int score;
-    int game_over;
-    int paused;
+} GameState;
 
-    int game_width;
-    int game_height;
-    int game_left;
-    int game_top;
-    int screen_width;
-    int screen_height;
+/* Global variables */
+static GameState *g_state = NULL;
+static int g_mem_fd = -1;
+static struct termios g_orig_termios;
+static bool g_terminal_raw = false;
+static volatile sig_atomic_t g_running = 1;
+static bool g_is_active = false;
+static bool g_initiated_takeover = false;  /* True if we pressed 't' */
+static const char *g_mem_file = MEM_FILE;  /* mmap file path */
+static off_t g_mem_offset = 0;             /* mmap offset */
 
-    GameMmap *mmap_state;
-    int mmap_fd;
-
-    /* Instance control */
-    uint32_t instance_id;         /* 1 or 2 */
-    int mode;                     /* MODE_PLAYER or MODE_WATCHER */
-} Game;
-
-/* Terminal state for restoration */
-static struct termios orig_termios;
-static int terminal_configured = 0;
-
-/* Frame buffer for flicker-free rendering */
-#define FRAME_BUF_SIZE 16384
-static char frame_buf[FRAME_BUF_SIZE];
-static int frame_pos = 0;
-
-/* Frame buffer functions */
-static void fb_clear(void) {
-    frame_pos = 0;
-}
-
-static void fb_putchar(char c) {
-    if (frame_pos < FRAME_BUF_SIZE - 1) {
-        frame_buf[frame_pos++] = c;
-    }
-}
-
-static void fb_puts(const char *s) {
-    while (*s && frame_pos < FRAME_BUF_SIZE - 1) {
-        frame_buf[frame_pos++] = *s++;
-    }
-}
-
-static void fb_printf(const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    int remaining = FRAME_BUF_SIZE - frame_pos - 1;
-    if (remaining > 0) {
-        int written = vsnprintf(frame_buf + frame_pos, remaining, fmt, args);
-        if (written > 0 && written < remaining) {
-            frame_pos += written;
-        }
-    }
-    va_end(args);
-}
-
-static void fb_move(int row, int col) {
-    fb_printf("\033[%d;%dH", row + 1, col + 1);
-}
-
-static void fb_flush(void) {
-    if (frame_pos > 0) {
-        write(STDOUT_FILENO, frame_buf, frame_pos);
-    }
-}
-
-/* Heartbeat timeout in milliseconds */
-#define HEARTBEAT_TIMEOUT_MS 500
-
-/* Snake speed settings (lower = faster) */
-#define MOVE_DELAY_INITIAL_MS 80
-#define MOVE_DELAY_MIN_MS 30
+/* Function prototypes */
+static void cleanup(void);
+static void signal_handler(int sig);
+static void setup_signals(void);
+static void enable_raw_mode(void);
+static void disable_raw_mode(void);
+static int setup_mmap(void);
+static void init_game(void);
+static void spawn_food(void);
+static void move_snake(void);
+static bool check_collision(void);
+static void handle_input(void);
+static void render(void);
+static void render_waiting(void);
+static int get_move_interval(void);
+static uint64_t get_time_ms(void);
+static void clear_screen(void);
+static void hide_cursor(void);
+static void show_cursor(void);
+static void move_cursor(int row, int col);
+static int kbhit(void);
+static int getch(void);
 
 /* Get current time in milliseconds */
-uint64_t get_time_ms(void) {
+static uint64_t get_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
-/* Physical memory offset */
-//#define DEVMEM "/dev/mem"
-//#define MEM_OFFSET 0x200000000ULL
-#define DEVMEM "./mem"
-#define MEM_OFFSET 0x0ULL
-
-/* Initialize mmap to /dev/mem */
-GameMmap* init_mmap(int *fd) {
-    *fd = open(DEVMEM, O_RDWR | O_SYNC);
-    if (*fd < 0) {
-        perror("open /dev/mem");
-        return NULL;
-    }
-
-    GameMmap *mm = mmap(NULL, MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, *fd, MEM_OFFSET);
-    if (mm == MAP_FAILED) {
-        perror("mmap");
-        close(*fd);
-        return NULL;
-    }
-
-    return mm;
-}
-
-/* Terminal control functions using ANSI escape codes */
-void term_clear(void) {
-    printf("\033[2J");
-}
-
-void term_move(int row, int col) {
-    printf("\033[%d;%dH", row + 1, col + 1);
-}
-
-void term_hide_cursor(void) {
-    printf("\033[?25l");
-}
-
-void term_show_cursor(void) {
-    printf("\033[?25h");
-}
-
-void term_flush(void) {
+/* Clear screen */
+static void clear_screen(void) {
+    printf("\033[2J\033[H");
     fflush(stdout);
 }
 
-/* Configure terminal for raw input */
-void term_raw_mode(void) {
-    if (terminal_configured) return;
-
-    tcgetattr(STDIN_FILENO, &orig_termios);
-    terminal_configured = 1;
-
-    struct termios raw = orig_termios;
-    raw.c_lflag &= ~(ECHO | ICANON);
-    raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 0;
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+/* Hide cursor */
+static void hide_cursor(void) {
+    printf("\033[?25l");
+    fflush(stdout);
 }
 
-/* Restore terminal settings */
-void term_restore(void) {
-    if (terminal_configured) {
-        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
-        terminal_configured = 0;
-    }
-    term_show_cursor();
-    printf(ANSI_RESET);
-    term_flush();
+/* Show cursor */
+static void show_cursor(void) {
+    printf("\033[?25h");
+    fflush(stdout);
 }
 
-/* Non-blocking character read */
-int term_getch(void) {
+/* Move cursor to position */
+static void move_cursor(int row, int col) {
+    printf("\033[%d;%dH", row, col);
+}
+
+/* Check if key is available */
+static int kbhit(void) {
+    struct timeval tv = {0, 0};
     fd_set fds;
-    struct timeval tv;
-
     FD_ZERO(&fds);
     FD_SET(STDIN_FILENO, &fds);
-    tv.tv_sec = 0;
-    tv.tv_usec = 50000;  /* 50ms timeout */
+    return select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0;
+}
 
-    if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0) {
-        unsigned char c;
-        if (read(STDIN_FILENO, &c, 1) == 1) {
-            /* Handle escape sequences for arrow keys */
-            if (c == 27) {  /* ESC */
-                unsigned char seq[2];
-                if (read(STDIN_FILENO, &seq[0], 1) == 1 && seq[0] == '[') {
-                    if (read(STDIN_FILENO, &seq[1], 1) == 1) {
-                        switch (seq[1]) {
-                            case 'A': return 1001;  /* Up */
-                            case 'B': return 1002;  /* Down */
-                            case 'C': return 1003;  /* Right */
-                            case 'D': return 1004;  /* Left */
-                        }
-                    }
-                }
-                return 27;
-            }
-            return c;
-        }
+/* Get character without blocking */
+static int getch(void) {
+    unsigned char c;
+    if (read(STDIN_FILENO, &c, 1) == 1) {
+        return c;
     }
-    return -1;  /* No input */
+    return -1;
+}
+
+/* Signal handler */
+static void signal_handler(int sig) {
+    (void)sig;
+    g_running = 0;
+}
+
+/* Setup signal handlers */
+static void setup_signals(void) {
+    struct sigaction sa;
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+}
+
+/* Enable raw terminal mode */
+static void enable_raw_mode(void) {
+    if (tcgetattr(STDIN_FILENO, &g_orig_termios) == -1) {
+        perror("tcgetattr");
+        exit(1);
+    }
+    g_terminal_raw = true;
+
+    struct termios raw = g_orig_termios;
+    raw.c_lflag &= ~(ECHO | ICANON | ISIG);
+    raw.c_iflag &= ~(IXON | ICRNL);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) {
+        perror("tcsetattr");
+        exit(1);
+    }
+}
+
+/* Disable raw terminal mode */
+static void disable_raw_mode(void) {
+    if (g_terminal_raw) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig_termios);
+        g_terminal_raw = false;
+    }
+}
+
+/* Cleanup function */
+static void cleanup(void) {
+    show_cursor();
+    disable_raw_mode();
+    clear_screen();
+
+    if (g_state != NULL) {
+        msync(g_state, sizeof(GameState), MS_SYNC);
+        munmap(g_state, sizeof(GameState));
+        g_state = NULL;
+    }
+
+    if (g_mem_fd != -1) {
+        close(g_mem_fd);
+        g_mem_fd = -1;
+    }
+}
+
+/* Setup mmap shared memory */
+static int setup_mmap(void) {
+    g_mem_fd = open(g_mem_file, O_RDWR | O_CREAT, 0666);
+    if (g_mem_fd == -1) {
+        perror("open");
+        return -1;
+    }
+
+    /* Ensure file is correct size (offset + GameState size) */
+    struct stat st;
+    if (fstat(g_mem_fd, &st) == -1) {
+        perror("fstat");
+        close(g_mem_fd);
+        return -1;
+    }
+
+/*    off_t required_size = g_mem_offset + (off_t)sizeof(GameState);
+    if (st.st_size < required_size) {
+        if (ftruncate(g_mem_fd, required_size) == -1) {
+            perror("ftruncate");
+            close(g_mem_fd);
+            return -1;
+        }
+    }*/
+
+    g_state = mmap(NULL, sizeof(GameState), PROT_READ | PROT_WRITE,
+                   MAP_SHARED, g_mem_fd, g_mem_offset);
+    if (g_state == MAP_FAILED) {
+        perror("mmap");
+        close(g_mem_fd);
+        g_state = NULL;
+        return -1;
+    }
+
+    if (g_state->magic_number != MAGIC_NUMBER) {
+        memset(g_state, 0, sizeof(GameState));
+        g_state->magic_number = MAGIC_NUMBER;
+    }
+
+    return 0;
+}
+
+/* Initialize a new game */
+static void init_game(void) {
+    g_state->game_state = STATE_RUNNING;
+    g_state->score = 0;
+    g_state->snake_length = INITIAL_SNAKE_LEN;
+    g_state->direction = DIR_RIGHT;
+
+    /* Initialize snake in center */
+    int start_x = BOARD_WIDTH / 2;
+    int start_y = BOARD_HEIGHT / 2;
+
+    for (uint32_t i = 0; i < g_state->snake_length; i++) {
+        g_state->snake[i].x = start_x - i;
+        g_state->snake[i].y = start_y;
+    }
+
+    spawn_food();
+    msync(g_state, sizeof(GameState), MS_SYNC);
 }
 
 /* Spawn food at random location */
-void spawn_food(Game *g) {
-    int valid = 0;
+static void spawn_food(void) {
+    bool valid = false;
+    int x, y;
+
     while (!valid) {
-        g->food.x = rand() % g->game_width;
-        g->food.y = rand() % g->game_height;
-        valid = 1;
-        for (int i = 0; i < g->snake_len; i++) {
-            if (g->snake[i].x == g->food.x && g->snake[i].y == g->food.y) {
-                valid = 0;
+        x = rand() % BOARD_WIDTH;
+        y = rand() % BOARD_HEIGHT;
+
+        valid = true;
+        for (uint32_t i = 0; i < g_state->snake_length; i++) {
+            if (g_state->snake[i].x == x && g_state->snake[i].y == y) {
+                valid = false;
                 break;
             }
         }
     }
+
+    g_state->food_x = x;
+    g_state->food_y = y;
 }
 
-/* Update mmap state (called by player) */
-void update_mmap(Game *g) {
-    GameMmap *mm = g->mmap_state;
-
-    mm->active_player = g->instance_id;
-    mm->heartbeat = get_time_ms();
-
-    mm->score = g->score;
-    if ((uint32_t)g->score > mm->high_score) {
-        mm->high_score = g->score;
-    }
-    mm->snake_length = g->snake_len;
-    if ((uint32_t)g->snake_len > mm->max_length) {
-        mm->max_length = g->snake_len;
-    }
-    mm->direction = g->direction;
-    mm->food_x = g->food.x;
-    mm->food_y = g->food.y;
-
-    if (g->game_over) {
-        mm->game_state = STATE_GAME_OVER;
-    } else if (g->paused) {
-        mm->game_state = STATE_PAUSED;
-    } else {
-        mm->game_state = STATE_RUNNING;
+/* Move the snake */
+static void move_snake(void) {
+    if (g_state->game_state != STATE_RUNNING) {
+        return;
     }
 
-    /* Copy snake body to mmap */
-    for (int i = 0; i < g->snake_len && i < MAX_SNAKE_LEN; i++) {
-        mm->snake[i].x = g->snake[i].x;
-        mm->snake[i].y = g->snake[i].y;
-    }
+    /* Calculate new head position */
+    Point new_head = g_state->snake[0];
 
-    msync(mm, sizeof(GameMmap), MS_ASYNC);
-}
-
-/* Load state from mmap (for takeover) */
-void load_from_mmap(Game *g) {
-    GameMmap *mm = g->mmap_state;
-
-    g->score = mm->score;
-    g->snake_len = mm->snake_length;
-    if (g->snake_len > MAX_SNAKE_LEN) g->snake_len = MAX_SNAKE_LEN;
-    if (g->snake_len < 1) g->snake_len = 0;
-    g->direction = mm->direction;
-    g->next_direction = mm->direction;
-    g->food.x = mm->food_x;
-    g->food.y = mm->food_y;
-    g->game_over = (mm->game_state == STATE_GAME_OVER);
-    g->paused = (mm->game_state == STATE_PAUSED);
-
-    /* Copy snake body from mmap */
-    for (int i = 0; i < g->snake_len; i++) {
-        g->snake[i].x = mm->snake[i].x;
-        g->snake[i].y = mm->snake[i].y;
-    }
-}
-
-/* Initialize/reset game */
-void reset_game(Game *g) {
-    int start_x = g->game_width / 2;
-    int start_y = g->game_height / 2;
-
-    g->snake_len = 3;
-    g->snake[0].x = start_x;
-    g->snake[0].y = start_y;
-    g->snake[1].x = start_x - 1;
-    g->snake[1].y = start_y;
-    g->snake[2].x = start_x - 2;
-    g->snake[2].y = start_y;
-
-    g->direction = DIR_RIGHT;
-    g->next_direction = DIR_RIGHT;
-    g->score = 0;
-    g->game_over = 0;
-    g->paused = 0;
-
-    spawn_food(g);
-
-    g->mmap_state->games_played++;
-    update_mmap(g);
-}
-
-/* Check if another instance is actively playing */
-int is_other_playing(Game *g) {
-    GameMmap *mm = g->mmap_state;
-    uint64_t now = get_time_ms();
-
-    /* Check if there's an active player that isn't us */
-    if (mm->active_player != 0 && mm->active_player != g->instance_id) {
-        /* Check if their heartbeat is recent */
-        if (now - mm->heartbeat < HEARTBEAT_TIMEOUT_MS) {
-            return 1;  /* Other instance is playing */
-        }
-    }
-    return 0;  /* No one else is playing */
-}
-
-/* Try to become the player */
-int try_become_player(Game *g) {
-    GameMmap *mm = g->mmap_state;
-    uint64_t now = get_time_ms();
-
-    /* If no active player or heartbeat timeout */
-    if (mm->active_player == 0 ||
-        mm->active_player == g->instance_id ||
-        (now - mm->heartbeat >= HEARTBEAT_TIMEOUT_MS)) {
-
-        g->mode = MODE_PLAYER;
-        mm->active_player = g->instance_id;
-        mm->heartbeat = now;
-        return 1;
-    }
-    return 0;
-}
-
-/* Initialize game */
-Game* init_game(void) {
-    Game *g = calloc(1, sizeof(Game));
-    if (!g) return NULL;
-
-    g->mmap_state = init_mmap(&g->mmap_fd);
-    if (!g->mmap_state) {
-        free(g);
-        return NULL;
-    }
-
-    /* Assign instance ID based on what's in mmap */
-    GameMmap *mm = g->mmap_state;
-    uint64_t now = get_time_ms();
-
-    if (mm->active_player == 0 || (now - mm->heartbeat >= HEARTBEAT_TIMEOUT_MS)) {
-        /* No active player, we become player 1 */
-        g->instance_id = 1;
-        g->mode = MODE_PLAYER;
-    } else if (mm->active_player == 1) {
-        /* Player 1 is active, we become player 2 (watcher) */
-        g->instance_id = 2;
-        g->mode = MODE_WATCHER;
-    } else {
-        /* Player 2 is active, we become player 1 (watcher) */
-        g->instance_id = 1;
-        g->mode = MODE_WATCHER;
-    }
-
-    /* Initialize terminal */
-    term_raw_mode();
-    term_hide_cursor();
-    term_clear();
-
-    /* Fixed 80x24 screen size */
-    g->screen_width = 80;
-    g->screen_height = 24;
-
-    g->game_top = 3;
-    g->game_left = 1;
-    g->game_height = g->screen_height - 5;  /* 19 rows */
-    g->game_width = g->screen_width - 4;    /* 76 cols */
-
-    srand(time(NULL) ^ getpid());  /* Different seed per instance */
-
-    if (g->mode == MODE_PLAYER) {
-        reset_game(g);
-    }
-    /* Watcher mode: don't load anything, just wait */
-
-    return g;
-}
-
-/* Draw walls */
-void draw_walls(Game *g) {
-    fb_puts(ANSI_CYAN);
-
-    /* Top wall */
-    fb_move(g->game_top - 1, g->game_left);
-    fb_putchar(CHAR_CORNER);
-    for (int x = 0; x < g->game_width; x++) {
-        fb_putchar(CHAR_WALL_H);
-    }
-    fb_putchar(CHAR_CORNER);
-
-    /* Bottom wall */
-    fb_move(g->game_top + g->game_height, g->game_left);
-    fb_putchar(CHAR_CORNER);
-    for (int x = 0; x < g->game_width; x++) {
-        fb_putchar(CHAR_WALL_H);
-    }
-    fb_putchar(CHAR_CORNER);
-
-    /* Side walls */
-    for (int y = 0; y < g->game_height; y++) {
-        fb_move(g->game_top + y, g->game_left);
-        fb_putchar(CHAR_WALL_V);
-        fb_move(g->game_top + y, g->game_left + g->game_width + 1);
-        fb_putchar(CHAR_WALL_V);
-    }
-
-    fb_puts(ANSI_RESET);
-}
-
-/* Draw score bar */
-void draw_score(Game *g) {
-    /* Title */
-    fb_puts(ANSI_BOLD ANSI_CYAN);
-    const char *title = "=== SNAKE GAME ===";
-    fb_move(0, (g->screen_width - strlen(title)) / 2);
-    fb_puts(title);
-    fb_puts(ANSI_RESET);
-
-    /* Mode indicator */
-    fb_move(0, 2);
-    if (g->mode == MODE_PLAYER) {
-        fb_printf(ANSI_BOLD ANSI_YELLOW "[P%d:PLAYING]" ANSI_RESET, g->instance_id);
-    } else {
-        fb_printf(ANSI_BOLD ANSI_YELLOW "[P%d:WATCHING]" ANSI_RESET, g->instance_id);
-    }
-
-    /* Score */
-    fb_puts(ANSI_BOLD ANSI_WHITE);
-    fb_move(1, 2);
-    fb_printf("Score: %-6d", g->score);
-    fb_puts(ANSI_RESET);
-
-    /* High score */
-    fb_puts(ANSI_BOLD ANSI_RED);
-    fb_move(1, g->screen_width / 2 - 10);
-    fb_printf("High Score: %-6d", g->mmap_state->high_score);
-    fb_puts(ANSI_RESET);
-
-    /* Games played */
-    fb_puts(ANSI_BLUE);
-    fb_move(1, g->screen_width - 20);
-    fb_printf("Games: %-6d", g->mmap_state->games_played);
-    fb_puts(ANSI_RESET);
-
-    /* Controls */
-    fb_puts(ANSI_WHITE);
-    fb_move(g->screen_height - 1, 0);
-    if (g->mode == MODE_PLAYER) {
-        const char *controls = "[Arrows] Move  [P] Pause  [R] Restart  [Q] Quit";
-        fb_move(g->screen_height - 1, (g->screen_width - strlen(controls)) / 2);
-        fb_puts(controls);
-    } else {
-        const char *controls = "[Q] Quit  --  Waiting for other player to stop...";
-        fb_move(g->screen_height - 1, (g->screen_width - strlen(controls)) / 2);
-        fb_puts(controls);
-    }
-    fb_puts(ANSI_RESET);
-}
-
-/* Draw snake */
-void draw_snake(Game *g) {
-    for (int i = 0; i < g->snake_len; i++) {
-        int screen_x = g->game_left + 1 + g->snake[i].x;
-        int screen_y = g->game_top + g->snake[i].y;
-
-        if (screen_x >= 0 && screen_x < g->screen_width - 1 &&
-            screen_y >= 0 && screen_y < g->screen_height - 1) {
-
-            fb_move(screen_y, screen_x);
-
-            if (i == 0) {
-                fb_puts(ANSI_BOLD ANSI_YELLOW);
-                char head_char;
-                switch (g->direction) {
-                    case DIR_UP:    head_char = CHAR_HEAD_UP; break;
-                    case DIR_DOWN:  head_char = CHAR_HEAD_DOWN; break;
-                    case DIR_LEFT:  head_char = CHAR_HEAD_LEFT; break;
-                    default:        head_char = CHAR_HEAD_RIGHT; break;
-                }
-                fb_putchar(head_char);
-                fb_puts(ANSI_RESET);
-            } else if (i == g->snake_len - 1) {
-                fb_puts(ANSI_BLUE);
-                fb_putchar(CHAR_TAIL);
-                fb_puts(ANSI_RESET);
-            } else {
-                fb_puts(ANSI_GREEN);
-                fb_putchar(CHAR_BODY);
-                fb_puts(ANSI_RESET);
-            }
-        }
-    }
-}
-
-/* Draw food */
-void draw_food(Game *g) {
-    int screen_x = g->game_left + 1 + g->food.x;
-    int screen_y = g->game_top + g->food.y;
-
-    if (screen_x >= 0 && screen_x < g->screen_width - 1 &&
-        screen_y >= 0 && screen_y < g->screen_height - 1) {
-        fb_move(screen_y, screen_x);
-        fb_puts(ANSI_BOLD ANSI_RED);
-        fb_putchar(CHAR_FOOD);
-        fb_puts(ANSI_RESET);
-    }
-}
-
-/* Draw game over screen */
-void draw_game_over(Game *g) {
-    const char *lines[] = {
-        "+------------------------+",
-        "|      GAME OVER!        |",
-        "|                        |",
-        "|  [R] Restart  [Q] Quit |",
-        "+------------------------+"
-    };
-    int num_lines = 5;
-    int start_y = g->screen_height / 2 - num_lines / 2;
-
-    fb_puts(ANSI_BOLD ANSI_MAGENTA);
-    for (int i = 0; i < num_lines; i++) {
-        int x = (g->screen_width - strlen(lines[i])) / 2;
-        fb_move(start_y + i, x);
-        fb_puts(lines[i]);
-    }
-
-    char score_line[30];
-    snprintf(score_line, sizeof(score_line), "|   Final Score: %-5d   |", g->score);
-    fb_move(start_y + 2, (g->screen_width - strlen(score_line)) / 2);
-    fb_puts(score_line);
-    fb_puts(ANSI_RESET);
-}
-
-/* Draw pause screen */
-void draw_paused(Game *g) {
-    const char *lines[] = {
-        "+-----------------+",
-        "|     PAUSED      |",
-        "|  [P] to Resume  |",
-        "+-----------------+"
-    };
-    int num_lines = 4;
-    int start_y = g->screen_height / 2 - num_lines / 2;
-
-    fb_puts(ANSI_BOLD ANSI_WHITE);
-    for (int i = 0; i < num_lines; i++) {
-        int x = (g->screen_width - strlen(lines[i])) / 2;
-        fb_move(start_y + i, x);
-        fb_puts(lines[i]);
-    }
-    fb_puts(ANSI_RESET);
-}
-
-/* Draw watcher waiting message */
-void draw_watcher_status(Game *g) {
-    const char *lines[] = {
-        "+-----------------------------+",
-        "|     WAITING FOR PLAYER      |",
-        "|                             |",
-        "|  Another instance is playing |",
-        "|  Will start when they quit  |",
-        "+-----------------------------+"
-    };
-    int num_lines = 6;
-    int start_y = g->screen_height / 2 - num_lines / 2;
-
-    fb_puts(ANSI_BOLD ANSI_YELLOW);
-    for (int i = 0; i < num_lines; i++) {
-        int x = (g->screen_width - strlen(lines[i])) / 2;
-        fb_move(start_y + i, x);
-        fb_puts(lines[i]);
-    }
-    fb_puts(ANSI_RESET);
-}
-
-/* Move snake */
-void move_snake(Game *g) {
-    if (g->game_over || g->paused) return;
-
-    g->direction = g->next_direction;
-
-    Point new_head = g->snake[0];
-
-    switch (g->direction) {
+    switch (g_state->direction) {
         case DIR_UP:    new_head.y--; break;
         case DIR_DOWN:  new_head.y++; break;
         case DIR_LEFT:  new_head.x--; break;
         case DIR_RIGHT: new_head.x++; break;
     }
 
-    if (new_head.x < 0 || new_head.x >= g->game_width ||
-        new_head.y < 0 || new_head.y >= g->game_height) {
-        g->game_over = 1;
-        update_mmap(g);
+    /* Check wall collision */
+    if (new_head.x < 0 || new_head.x >= BOARD_WIDTH ||
+        new_head.y < 0 || new_head.y >= BOARD_HEIGHT) {
+        g_state->game_state = STATE_GAMEOVER;
+        if (g_state->score > g_state->high_score) {
+            g_state->high_score = g_state->score;
+        }
+        msync(g_state, sizeof(GameState), MS_SYNC);
         return;
     }
 
-    for (int i = 0; i < g->snake_len; i++) {
-        if (g->snake[i].x == new_head.x && g->snake[i].y == new_head.y) {
-            g->game_over = 1;
-            update_mmap(g);
+    /* Check for food collision first */
+    bool ate_food = (new_head.x == g_state->food_x && new_head.y == g_state->food_y);
+
+    /* Move body segments */
+    if (ate_food) {
+        /* Grow snake */
+        if (g_state->snake_length < MAX_SNAKE_LEN) {
+            /* Shift all segments back */
+            for (uint32_t i = g_state->snake_length; i > 0; i--) {
+                g_state->snake[i] = g_state->snake[i - 1];
+            }
+            g_state->snake_length++;
+        }
+    } else {
+        /* Normal move - shift segments */
+        for (uint32_t i = g_state->snake_length - 1; i > 0; i--) {
+            g_state->snake[i] = g_state->snake[i - 1];
+        }
+    }
+
+    /* Set new head */
+    g_state->snake[0] = new_head;
+
+    /* Check for self collision */
+    if (check_collision()) {
+        g_state->game_state = STATE_GAMEOVER;
+        if (g_state->score > g_state->high_score) {
+            g_state->high_score = g_state->score;
+        }
+    }
+
+    /* Handle food */
+    if (ate_food) {
+        g_state->score += 10;
+        spawn_food();
+    }
+
+    msync(g_state, sizeof(GameState), MS_SYNC);
+}
+
+/* Check if snake collided with itself */
+static bool check_collision(void) {
+    Point head = g_state->snake[0];
+
+    for (uint32_t i = 1; i < g_state->snake_length; i++) {
+        if (g_state->snake[i].x == head.x && g_state->snake[i].y == head.y) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+/* Get move interval based on score */
+static int get_move_interval(void) {
+    int interval = BASE_MOVE_INTERVAL_MS - (g_state->score / 50) * 10;
+    if (interval < MIN_MOVE_INTERVAL_MS) {
+        interval = MIN_MOVE_INTERVAL_MS;
+    }
+    return interval;
+}
+
+/* Handle keyboard input */
+static void handle_input(void) {
+    while (kbhit()) {
+        int c = getch();
+
+        if (c == 'q' || c == 'Q') {
+            g_running = 0;
             return;
         }
-    }
 
-    for (int i = g->snake_len - 1; i > 0; i--) {
-        g->snake[i] = g->snake[i - 1];
-    }
-    g->snake[0] = new_head;
-
-    if (new_head.x == g->food.x && new_head.y == g->food.y) {
-        if (g->snake_len < MAX_SNAKE_LEN) {
-            g->snake_len++;
+        if (c == 'p' || c == 'P') {
+            if (g_state->game_state == STATE_RUNNING) {
+                g_state->game_state = STATE_PAUSED;
+            } else if (g_state->game_state == STATE_PAUSED) {
+                g_state->game_state = STATE_RUNNING;
+            }
+            msync(g_state, sizeof(GameState), MS_SYNC);
+            continue;
         }
-        g->score += 10;
-        g->mmap_state->total_food++;
-        spawn_food(g);
-    }
 
-    update_mmap(g);
-}
+        if (c == 'r' || c == 'R') {
+            if (g_state->game_state == STATE_GAMEOVER) {
+                init_game();
+            }
+            continue;
+        }
 
-/* Handle input for player mode */
-int handle_player_input(Game *g) {
-    int ch = term_getch();
-    if (ch < 0) return 1;  /* No input */
+        if (c == 't' || c == 'T') {
+            /* Request takeover - hand control to waiting process */
+            g_state->takeover_request = 1;
+            msync(g_state, sizeof(GameState), MS_SYNC);
+            g_is_active = false;  /* Switch to waiting mode */
+            g_initiated_takeover = true;  /* Don't respond to our own request */
+            return;
+        }
 
-    switch (ch) {
-        case 'q':
-        case 'Q':
-            /* Clear active player on quit */
-            g->mmap_state->active_player = 0;
-            msync(g->mmap_state, sizeof(GameMmap), MS_SYNC);
-            return 0;
+        /* Arrow keys (ESC [ A/B/C/D) */
+        if (c == 27) {  /* ESC */
+            if (kbhit()) {
+                c = getch();
+                if (c == '[') {
+                    if (kbhit()) {
+                        c = getch();
+                        uint32_t new_dir = g_state->direction;
 
-        case 'r':
-        case 'R':
-            reset_game(g);
-            break;
+                        switch (c) {
+                            case 'A': /* Up */
+                                if (g_state->direction != DIR_DOWN)
+                                    new_dir = DIR_UP;
+                                break;
+                            case 'B': /* Down */
+                                if (g_state->direction != DIR_UP)
+                                    new_dir = DIR_DOWN;
+                                break;
+                            case 'C': /* Right */
+                                if (g_state->direction != DIR_LEFT)
+                                    new_dir = DIR_RIGHT;
+                                break;
+                            case 'D': /* Left */
+                                if (g_state->direction != DIR_RIGHT)
+                                    new_dir = DIR_LEFT;
+                                break;
+                        }
 
-        case 'p':
-        case 'P':
-            g->paused = !g->paused;
-            update_mmap(g);
-            break;
+                        if (g_state->game_state == STATE_RUNNING &&
+                            new_dir != g_state->direction) {
+                            g_state->direction = new_dir;
+                            msync(g_state, sizeof(GameState), MS_SYNC);
+                        }
+                        continue;  /* Don't process arrow key char as WASD */
+                    }
+                }
+            }
+            continue;  /* ESC was pressed, skip WASD check */
+        }
 
-        case 1001:  /* Up arrow */
-            if (!g->game_over && !g->paused && g->direction != DIR_DOWN)
-                g->next_direction = DIR_UP;
-            break;
+        /* WASD keys as alternative */
+        if (g_state->game_state == STATE_RUNNING) {
+            uint32_t new_dir = g_state->direction;
 
-        case 1002:  /* Down arrow */
-            if (!g->game_over && !g->paused && g->direction != DIR_UP)
-                g->next_direction = DIR_DOWN;
-            break;
+            switch (c) {
+                case 'w': case 'W':
+                    if (g_state->direction != DIR_DOWN)
+                        new_dir = DIR_UP;
+                    break;
+                case 's': case 'S':
+                    if (g_state->direction != DIR_UP)
+                        new_dir = DIR_DOWN;
+                    break;
+                case 'a': case 'A':
+                    if (g_state->direction != DIR_RIGHT)
+                        new_dir = DIR_LEFT;
+                    break;
+                case 'd': case 'D':
+                    if (g_state->direction != DIR_LEFT)
+                        new_dir = DIR_RIGHT;
+                    break;
+            }
 
-        case 1004:  /* Left arrow */
-            if (!g->game_over && !g->paused && g->direction != DIR_RIGHT)
-                g->next_direction = DIR_LEFT;
-            break;
-
-        case 1003:  /* Right arrow */
-            if (!g->game_over && !g->paused && g->direction != DIR_LEFT)
-                g->next_direction = DIR_RIGHT;
-            break;
-    }
-
-    return 1;
-}
-
-/* Handle input for watcher mode */
-int handle_watcher_input(Game *g) {
-    (void)g;  /* Unused in watcher mode */
-    int ch = term_getch();
-
-    if (ch == 'q' || ch == 'Q') {
-        return 0;
-    }
-
-    return 1;
-}
-
-/* Draw everything */
-void draw(Game *g) {
-    fb_clear();
-    fb_puts("\033[H");  /* Cursor home instead of clear */
-
-    /* Clear the game area by drawing spaces */
-    for (int y = g->game_top; y < g->game_top + g->game_height; y++) {
-        fb_move(y, g->game_left + 1);
-        for (int x = 0; x < g->game_width; x++) {
-            fb_putchar(' ');
+            if (new_dir != g_state->direction) {
+                g_state->direction = new_dir;
+                msync(g_state, sizeof(GameState), MS_SYNC);
+            }
         }
     }
+}
 
-    draw_walls(g);
-    draw_score(g);
+/* Render the game board */
+static void render(void) {
+    move_cursor(1, 1);
 
-    if (g->mode == MODE_WATCHER) {
-        /* Watcher only shows blank screen with waiting message */
-        draw_watcher_status(g);
+    /* Title and score */
+    printf("%s========== SNAKE GAME ==========%s\n", COLOR_CYAN, COLOR_RESET);
+    printf("Score: %s%u%s  |  High Score: %s%u%s  |  Length: %u\n",
+           COLOR_YELLOW, g_state->score, COLOR_RESET,
+           COLOR_GREEN, g_state->high_score, COLOR_RESET,
+           g_state->snake_length);
+
+    /* Top border */
+    printf("%s+", COLOR_WHITE);
+    for (int i = 0; i < BOARD_WIDTH; i++) printf("-");
+    printf("+%s\n", COLOR_RESET);
+
+    /* Game board */
+    for (int y = 0; y < BOARD_HEIGHT; y++) {
+        printf("%s|%s", COLOR_WHITE, COLOR_RESET);
+
+        for (int x = 0; x < BOARD_WIDTH; x++) {
+            bool is_snake = false;
+            bool is_head = false;
+            bool is_food = false;
+
+            /* Check if position is snake head */
+            if (g_state->snake[0].x == x && g_state->snake[0].y == y) {
+                is_head = true;
+                is_snake = true;
+            }
+
+            /* Check if position is snake body */
+            if (!is_head) {
+                for (uint32_t i = 1; i < g_state->snake_length; i++) {
+                    if (g_state->snake[i].x == x && g_state->snake[i].y == y) {
+                        is_snake = true;
+                        break;
+                    }
+                }
+            }
+
+            /* Check if position is food */
+            if (g_state->food_x == x && g_state->food_y == y) {
+                is_food = true;
+            }
+
+            if (is_head) {
+                printf("%s@%s", COLOR_BRIGHT_GREEN, COLOR_RESET);
+            } else if (is_snake) {
+                printf("%so%s", COLOR_GREEN, COLOR_RESET);
+            } else if (is_food) {
+                printf("%s*%s", COLOR_RED, COLOR_RESET);
+            } else {
+                printf(" ");
+            }
+        }
+
+        printf("%s|%s\n", COLOR_WHITE, COLOR_RESET);
+    }
+
+    /* Bottom border */
+    printf("%s+", COLOR_WHITE);
+    for (int i = 0; i < BOARD_WIDTH; i++) printf("-");
+    printf("+%s\n", COLOR_RESET);
+
+    /* Status and controls - single line to fit 80x24 */
+    if (g_state->game_state == STATE_PAUSED) {
+        printf("%s*** PAUSED - Press P to resume ***%s", COLOR_YELLOW, COLOR_RESET);
+    } else if (g_state->game_state == STATE_GAMEOVER) {
+        printf("%s*** GAME OVER - Press R to restart, Q to quit ***%s", COLOR_RED, COLOR_RESET);
     } else {
-        /* Player mode - show game */
-        draw_food(g);
-        draw_snake(g);
+        printf("Arrows/WASD: Move | P: Pause | T: Transfer | Q: Quit");
+    }
 
-        if (g->game_over) {
-            draw_game_over(g);
-        } else if (g->paused) {
-            draw_paused(g);
+    fflush(stdout);
+}
+
+/* Render waiting screen with dialog box */
+static void render_waiting(void) {
+    /* Dialog box dimensions */
+    #define DIALOG_WIDTH 50
+    #define DIALOG_HEIGHT 9
+    int dialog_start_col = (80 - DIALOG_WIDTH) / 2;
+    int dialog_start_row = (24 - DIALOG_HEIGHT) / 2;
+
+    move_cursor(1, 1);
+
+    for (int row = 1; row <= 24; row++) {
+        move_cursor(row, 1);
+
+        /* Check if this row is part of the dialog */
+        int dialog_row = row - dialog_start_row;
+
+        if (dialog_row >= 0 && dialog_row < DIALOG_HEIGHT) {
+            /* Print spaces before dialog */
+            for (int i = 1; i < dialog_start_col; i++) printf(" ");
+
+            /* Print dialog content */
+            if (dialog_row == 0) {
+                /* Top border */
+                printf("%s+", COLOR_CYAN);
+                for (int i = 0; i < DIALOG_WIDTH - 2; i++) printf("-");
+                printf("+%s", COLOR_RESET);
+            } else if (dialog_row == DIALOG_HEIGHT - 1) {
+                /* Bottom border */
+                printf("%s+", COLOR_CYAN);
+                for (int i = 0; i < DIALOG_WIDTH - 2; i++) printf("-");
+                printf("+%s", COLOR_RESET);
+            } else {
+                /* Content rows */
+                printf("%s|%s", COLOR_CYAN, COLOR_RESET);
+
+                char line[DIALOG_WIDTH - 1];
+                memset(line, ' ', DIALOG_WIDTH - 2);
+                line[DIALOG_WIDTH - 2] = '\0';
+
+                if (dialog_row == 2) {
+                    const char *title = "WAITING FOR CONTROL";
+                    int title_start = (DIALOG_WIDTH - 2 - (int)strlen(title)) / 2;
+                    memcpy(line + title_start, title, strlen(title));
+                    printf("%s%s%s", COLOR_YELLOW, line, COLOR_RESET);
+                } else if (dialog_row == 4) {
+                    const char *msg = "Another process is running the game.";
+                    int msg_start = (DIALOG_WIDTH - 2 - (int)strlen(msg)) / 2;
+                    memcpy(line + msg_start, msg, strlen(msg));
+                    printf("%s", line);
+                } else if (dialog_row == 5) {
+                    char score_line[64];
+                    snprintf(score_line, sizeof(score_line),
+                             "Score: %u  |  High Score: %u",
+                             g_state->score, g_state->high_score);
+                    int score_start = (DIALOG_WIDTH - 2 - (int)strlen(score_line)) / 2;
+                    memcpy(line + score_start, score_line, strlen(score_line));
+                    printf("%s", line);
+                } else if (dialog_row == 7) {
+                    const char *quit_msg = "Press Q to quit";
+                    int quit_start = (DIALOG_WIDTH - 2 - (int)strlen(quit_msg)) / 2;
+                    memcpy(line + quit_start, quit_msg, strlen(quit_msg));
+                    printf("%s%s%s", COLOR_WHITE, line, COLOR_RESET);
+                } else {
+                    printf("%s", line);
+                }
+
+                printf("%s|%s", COLOR_CYAN, COLOR_RESET);
+            }
+
+            /* Print spaces after dialog */
+            for (int i = dialog_start_col + DIALOG_WIDTH; i <= 80; i++) printf(" ");
+        } else {
+            /* Empty row outside dialog */
+            for (int i = 0; i < 80; i++) printf(" ");
         }
     }
 
-    /* Move cursor to corner so it doesn't follow the snake */
-    fb_puts("\033[1;1H");
-
-    fb_flush();
+    fflush(stdout);
 }
 
-/* Cleanup */
-void cleanup(Game *g) {
-    if (g) {
-        /* If we're the player, clear active player on exit */
-        if (g->mode == MODE_PLAYER && g->mmap_state) {
-            g->mmap_state->active_player = 0;
-            msync(g->mmap_state, sizeof(GameMmap), MS_SYNC);
+/* Print usage */
+static void print_usage(const char *prog) {
+    fprintf(stderr, "Usage: %s [file] [offset]\n", prog);
+    fprintf(stderr, "  file   - mmap file path (default: %s)\n", MEM_FILE);
+    fprintf(stderr, "  offset - hex offset in file, e.g. 1000 or 0x1000 (default: 0)\n");
+}
+
+/* Main function */
+int main(int argc, char *argv[]) {
+    /* Parse arguments */
+    if (argc > 1) {
+        if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+            print_usage(argv[0]);
+            return 0;
         }
-        if (g->mmap_state) {
-            munmap(g->mmap_state, MMAP_SIZE);
-        }
-        if (g->mmap_fd >= 0) {
-            close(g->mmap_fd);
-        }
-        free(g);
+        g_mem_file = argv[1];
     }
-    term_restore();
-    term_clear();
-    term_move(0, 0);
-    term_flush();
-}
-
-/* Signal handler for clean exit */
-static Game *global_game = NULL;
-
-void signal_handler(int sig) {
-    (void)sig;
-    if (global_game) {
-        cleanup(global_game);
+    if (argc > 2) {
+        char *endptr;
+        long long offset = strtoll(argv[2], &endptr, 16);
+        if (*endptr != '\0' || offset < 0) {
+            fprintf(stderr, "Invalid hex offset: %s\n", argv[2]);
+            print_usage(argv[0]);
+            return 1;
+        }
+        g_mem_offset = (off_t)offset;
     }
-    exit(0);
-}
 
-/* Main */
-int main(void) {
-    Game *game = init_game();
-    if (!game) {
-        fprintf(stderr, "Failed to initialize game\n");
+    /* Initialize random seed */
+    srand((unsigned int)time(NULL) ^ (unsigned int)getpid());
+
+    /* Setup cleanup */
+    atexit(cleanup);
+    setup_signals();
+
+    /* Setup mmap */
+    if (setup_mmap() != 0) {
+        fprintf(stderr, "Failed to setup shared memory\n");
         return 1;
     }
 
-    global_game = game;
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    /* Enable terminal raw mode */
+    enable_raw_mode();
+    hide_cursor();
+    clear_screen();
 
-    struct timespec last_move;
-    clock_gettime(CLOCK_MONOTONIC, &last_move);
+    /* Check if another process is active */
+    uint64_t initial_heartbeat = g_state->heartbeat;
 
-    int move_delay_ms = MOVE_DELAY_INITIAL_MS;
+    printf("Checking for active process...\n");
+    fflush(stdout);
 
-    while (1) {
-        if (game->mode == MODE_PLAYER) {
-            /* Player mode */
-            if (!handle_player_input(game)) {
-                break;
-            }
+    /* Wait 1.5 seconds to check heartbeat */
+    usleep(1500000);
 
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            long elapsed_ms = (now.tv_sec - last_move.tv_sec) * 1000 +
-                             (now.tv_nsec - last_move.tv_nsec) / 1000000;
+    uint64_t current_heartbeat = g_state->heartbeat;
 
-            if (elapsed_ms >= move_delay_ms) {
-                move_snake(game);
-                last_move = now;
+    if (current_heartbeat != initial_heartbeat) {
+        /* Another process is active, enter waiting state */
+        g_is_active = false;
+    } else {
+        /* No active process, we become active */
+        g_is_active = true;
 
-                move_delay_ms = MOVE_DELAY_INITIAL_MS - (game->score / 30);
-                if (move_delay_ms < MOVE_DELAY_MIN_MS) move_delay_ms = MOVE_DELAY_MIN_MS;
-            }
-        } else {
-            /* Watcher mode - just wait for takeover */
-            if (!handle_watcher_input(game)) {
-                break;
-            }
-
-            /* Check if we can take over */
-            if (!is_other_playing(game)) {
-                /* Take over as player */
-                if (try_become_player(game)) {
-                    /* Load last game state */
-                    load_from_mmap(game);
-
-                    /* If game was over or invalid, start fresh */
-                    if (game->game_over || game->snake_len == 0) {
-                        reset_game(game);
-                    } else {
-                        /* Continue the game, update mmap with our heartbeat */
-                        update_mmap(game);
-                    }
-                    clock_gettime(CLOCK_MONOTONIC, &last_move);
-                }
-            }
+        /* Initialize new game if needed */
+        if (g_state->snake_length == 0) {
+            init_game();
         }
-
-        draw(game);
     }
 
-    cleanup(game);
+    /* Main state loop - can switch between active and waiting */
+    while (g_running) {
+        if (g_is_active) {
+            /* Active game loop */
+            clear_screen();
+
+            /* Clear any pending takeover request since we're now active */
+            g_state->takeover_request = 0;
+            msync(g_state, sizeof(GameState), MS_SYNC);
+
+            uint64_t last_move_time = get_time_ms();
+            uint64_t last_heartbeat_time = get_time_ms();
+
+            while (g_running && g_is_active) {
+                uint64_t now = get_time_ms();
+
+                /* Handle input (may set g_is_active = false on 't' press) */
+                handle_input();
+
+                if (!g_running || !g_is_active) break;
+
+                /* Update heartbeat every 500ms */
+                if (now - last_heartbeat_time >= 500) {
+                    g_state->heartbeat++;
+                    msync(g_state, sizeof(GameState), MS_SYNC);
+                    last_heartbeat_time = now;
+                }
+
+                /* Move snake at interval */
+                int move_interval = get_move_interval();
+                if (g_state->game_state == STATE_RUNNING &&
+                    now - last_move_time >= (uint64_t)move_interval) {
+                    move_snake();
+                    last_move_time = now;
+                }
+
+                /* Render */
+                render();
+
+                /* Small delay to prevent CPU hogging */
+                usleep(16000);  /* ~60 FPS */
+            }
+        } else {
+            /* Waiting loop */
+            clear_screen();
+
+            uint64_t last_heartbeat = g_state->heartbeat;
+            uint64_t last_check_time = get_time_ms();
+
+            while (g_running && !g_is_active) {
+                /* Handle quit input */
+                while (kbhit()) {
+                    int c = getch();
+                    if (c == 'q' || c == 'Q') {
+                        g_running = 0;
+                        break;
+                    }
+                    /* Handle ESC sequences */
+                    if (c == 27) {
+                        while (kbhit()) getch();
+                    }
+                }
+
+                if (!g_running) break;
+
+                /* Check for takeover request (active pressed 't') */
+                if (g_state->takeover_request) {
+                    if (!g_initiated_takeover) {
+                        /* Other process wants to hand over control to us */
+                        g_is_active = true;
+                        g_state->takeover_request = 0;
+                        msync(g_state, sizeof(GameState), MS_SYNC);
+                        clear_screen();
+                        break;
+                    }
+                    /* else: We initiated this - wait for other process to respond */
+                } else if (g_initiated_takeover) {
+                    /* Takeover request was cleared - other process took over */
+                    g_initiated_takeover = false;
+                }
+
+                /* Check heartbeat every second */
+                uint64_t now = get_time_ms();
+                if (now - last_check_time >= 1000) {
+                    uint64_t current_hb = g_state->heartbeat;
+
+                    if (current_hb == last_heartbeat) {
+                        /* Other process died, take over */
+                        g_is_active = true;
+                        g_initiated_takeover = false;
+                        clear_screen();
+                        printf("Taking over control...\n");
+                        fflush(stdout);
+                        usleep(500000);
+
+                        /* Resume from saved state */
+                        if (g_state->snake_length == 0) {
+                            init_game();
+                        }
+                        break;
+                    }
+
+                    last_heartbeat = current_hb;
+                    last_check_time = now;
+                }
+
+                render_waiting();
+                usleep(100000);  /* 100ms */
+            }
+        }
+    }
+
     return 0;
 }
