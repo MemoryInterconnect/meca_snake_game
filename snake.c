@@ -21,7 +21,7 @@
 #define MAX_SNAKE_LEN 1000
 #define BOARD_WIDTH 78
 #define BOARD_HEIGHT 18
-#define MEM_FILE "./mem"
+#define MEM_FILE "/dev/mem"
 #define INITIAL_SNAKE_LEN 3
 #define BASE_MOVE_INTERVAL_MS 200
 #define MIN_MOVE_INTERVAL_MS 50
@@ -81,7 +81,7 @@ static volatile sig_atomic_t g_running = 1;
 static bool g_is_active = false;
 static bool g_initiated_takeover = false;  /* True if we pressed 't' */
 static const char *g_mem_file = MEM_FILE;  /* mmap file path */
-static off_t g_mem_offset = 0;             /* mmap offset */
+static off_t g_mem_offset = 0x200000000;   /* mmap offset */
 
 /* Function prototypes */
 static void cleanup(void);
